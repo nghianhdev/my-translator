@@ -77,29 +77,15 @@ class App {
 
     async _checkPlatformSupport() {
         try {
-            // Check if we're on macOS Apple Silicon
             const arch = await invoke('get_platform_info');
             const info = JSON.parse(arch);
             this.isAppleSilicon = (info.os === 'macos' && info.arch === 'aarch64');
+            this.isWindows = info.os === 'windows';
         } catch {
-            // Fallback: check via navigator
-            this.isAppleSilicon = navigator.platform === 'MacIntel' &&
-                navigator.userAgent.includes('Mac OS X');
+            this.isAppleSilicon = false;
+            this.isWindows = navigator.platform === 'Win32';
         }
-
-        if (!this.isAppleSilicon) {
-            // Hide Local MLX option
-            const select = document.getElementById('select-translation-mode');
-            const localOption = select?.querySelector('option[value="local"]');
-            if (localOption) localOption.remove();
-
-            // Force soniox mode if user had local selected
-            const settings = settingsManager.get();
-            if (settings.translation_mode === 'local') {
-                settings.translation_mode = 'soniox';
-                settingsManager.save(settings);
-            }
-        }
+        // Local mode is available on both Windows and macOS (Apple Silicon uses MLX; Windows uses faster-whisper)
     }
 
     // ─── Event Binding ──────────────────────────────────────
@@ -443,8 +429,8 @@ class App {
         document.getElementById('input-api-key').value = s.soniox_api_key || '';
         document.getElementById('select-source-lang').value = s.source_language || 'auto';
         document.getElementById('select-target-lang').value = s.target_language || 'vi';
-        document.getElementById('select-translation-mode').value = s.translation_mode || 'soniox';
-        this._updateModeUI(s.translation_mode || 'soniox');
+        document.getElementById('select-translation-mode').value = s.translation_mode || 'local';
+        this._updateModeUI(s.translation_mode || 'local');
 
         // Audio source radio
         const radioValue = s.audio_source || 'system';
@@ -690,21 +676,20 @@ class App {
     _updateModeUI(mode) {
         const hintSoniox = document.getElementById('hint-mode-soniox');
         const hintLocal = document.getElementById('hint-mode-local');
-
-        if (hintSoniox) hintSoniox.style.display = mode === 'soniox' ? '' : 'none';
         if (hintLocal) hintLocal.style.display = mode === 'local' ? '' : 'none';
+        if (hintSoniox) hintSoniox.style.display = mode === 'soniox' ? '' : 'none';
     }
 
     // ─── Start/Stop ────────────────────────────────────────
 
     async start() {
         const settings = settingsManager.get();
-        this.translationMode = settings.translation_mode || 'soniox';
+        this.translationMode = settings.translation_mode || 'local';
         console.log('[App] start() called, translation_mode:', this.translationMode, 'settings:', JSON.stringify(settings));
 
-        // Always check Soniox API key (required for all modes)
-        if (!settings.soniox_api_key) {
-            this._showToast('Soniox API key is required. Add it in Settings.', 'error');
+        // Soniox API key required only when using Cloud mode
+        if (this.translationMode === 'soniox' && !settings.soniox_api_key) {
+            this._showToast('Soniox API key is required for Cloud mode. Add it in Settings.', 'error');
             this._showView('settings');
             return;
         }

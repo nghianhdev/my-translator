@@ -181,15 +181,15 @@
         <div class="settings-section">
           <span class="field-label">Engine</span>
           <select id="select-translation-mode">
+            <option value="local">🖥️ Local (Offline) — Windows &amp; macOS</option>
             <option value="soniox">☁️ Soniox API (Cloud)</option>
-            <option value="local">🖥️ Local MLX (Offline)</option>
           </select>
-          <p class="hint" id="hint-mode-soniox">Real-time, 70+ languages, ~$0.12/hr</p>
-          <p class="hint" id="hint-mode-local" style="display:none">Offline, free, ~3-4s delay</p>
+          <p class="hint" id="hint-mode-local">Offline, free, Windows &amp; macOS. One-time setup ~2–5GB.</p>
+          <p class="hint" id="hint-mode-soniox" style="display:none">Real-time, 70+ languages, ~$0.12/hr</p>
         </div>
 
         <div class="settings-section" id="section-api-key">
-          <span class="field-label">Soniox API Key <span class="required-badge">Required</span></span>
+          <span class="field-label">Soniox API Key <span class="optional-badge">For Cloud mode</span></span>
           <div class="input-group">
             <input type="password" id="input-api-key" placeholder="Enter your Soniox API key..." autocomplete="off" />
             <button id="btn-toggle-key" class="icon-btn small" title="Show/Hide">

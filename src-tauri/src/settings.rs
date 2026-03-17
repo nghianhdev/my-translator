@@ -55,7 +55,7 @@ impl Default for Settings {
             font_size: 16,
             max_lines: 5,
             show_original: true,
-            translation_mode: "soniox".to_string(),
+            translation_mode: "local".to_string(),
             custom_context: None,
             elevenlabs_api_key: String::new(),
             tts_enabled: false,

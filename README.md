@@ -26,20 +26,22 @@ System Audio / Mic → 48kHz → 16kHz PCM → Soniox WebSocket (STT + Translati
                                                                               TTS → 🔊
 ```
 
-**🖥️ Local Mode (MLX — Apple Silicon only)**
+**🖥️ Local Mode (default) — Windows & macOS**
 ```
-System Audio / Mic → 48kHz → 16kHz PCM → Whisper ASR → Gemma LLM → Overlay UI
-                                           (on-device)   (on-device)  ↓ (optional)
-                                                                   TTS → 🔊
+System Audio / Mic → 16kHz PCM → Whisper ASR → Translation → Overlay UI
+                     (on-device)   (on-device)     ↓ (optional)
+                                                 TTS → 🔊
 ```
+- **Windows:** faster-whisper + Helsinki-NLP (OPUS-MT). One-time setup ~2–5GB.
+- **macOS (Apple Silicon):** MLX + Whisper + Gemma. One-time setup ~5GB.
 
-| | ☁️ Cloud (Soniox) | 🖥️ Local (MLX) |
-|-|-------------------|----------------|
-| **Latency** | ~2–3s | ~10s |
-| **Languages** | 70+ | JA/EN/ZH/KO → VI/EN |
-| **Cost** | ~$0.12/hr | Free |
-| **Internet** | Required | Not needed |
-| **Platform** | All | Apple Silicon only |
+| | 🖥️ Local (default) | ☁️ Cloud (Soniox) |
+|-|---------------------|-------------------|
+| **Latency** | ~5–10s | ~2–3s |
+| **Languages** | JA/EN/ZH/KO/… → VI/EN | 70+ |
+| **Cost** | Free | ~$0.12/hr |
+| **Internet** | Not needed | Required |
+| **Platform** | Windows 10/11, macOS (Apple Silicon) | All |
 
 ---
 
@@ -80,7 +82,7 @@ Read translations aloud as they appear. Three providers to choose from — no se
 - **[ScreenCaptureKit](https://developer.apple.com/documentation/screencapturekit)** — macOS system audio capture
 - **[cpal](https://github.com/RustAudio/cpal)** — Cross-platform microphone input
 - **[Soniox](https://soniox.com)** — Real-time STT + translation (Cloud mode)
-- **[MLX](https://github.com/ml-explore/mlx) + [Whisper](https://github.com/openai/whisper) + [Gemma](https://ai.google.dev/gemma)** — On-device inference (Local mode)
+- **Local mode:** [faster-whisper](https://github.com/SYSTRAN/faster-whisper) + [Helsinki-NLP OPUS-MT](https://huggingface.co/Helsinki-NLP) (Windows); [MLX](https://github.com/ml-explore/mlx) + Whisper + Gemma (macOS Apple Silicon)
 - **[Edge TTS](https://learn.microsoft.com/en-us/azure/ai-services/speech-service/index-text-to-speech)** — Neural TTS, free, no key required (default)
 - **Web Speech API** — OS-native TTS, offline
 - **[ElevenLabs](https://elevenlabs.io)** — Premium TTS, API key required
@@ -96,7 +98,7 @@ npm install
 npm run tauri build
 ```
 
-Requires: Rust (stable), Node.js 18+, macOS 13+ (Apple Silicon).
+Requires: Rust (stable), Node.js 18+. For Local mode: Windows 10/11 or macOS 13+ (Apple Silicon). Python 3.9+ for Windows local pipeline.
 
 ---
 
