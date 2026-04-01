@@ -7,7 +7,8 @@ Hướng dẫn từng bước cài đặt và sử dụng **My Translator** trê
 ## Yêu cầu
 
 - Windows 10 trở lên (x64 hoặc ARM64)
-- API key từ [Soniox](https://soniox.com) (trả theo dùng, ~$0.12/giờ)
+- **Chế độ Cloud**: API key từ [Soniox](https://soniox.com) (trả theo dùng, ~$0.12/giờ)
+- **Chế độ Local** (tuỳ chọn): Python 3.10+ đã cài đặt, ~5 GB dung lượng ổ cứng (cho mô hình AI, tải một lần)
 - **Thuyết minh TTS** (tuỳ chọn): API key của [ElevenLabs](https://elevenlabs.io) (gói Starter $5/tháng)
 
 ---

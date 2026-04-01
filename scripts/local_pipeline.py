@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """
 Local translation pipeline sidecar for My Translator.
-Receives PCM audio via stdin, transcribes with Whisper, translates with Qwen2.5 LLM.
+Receives PCM audio via stdin, transcribes with Whisper, translates with LLM.
 Outputs JSON results via stdout.
+
+Backends:
+  macOS Apple Silicon: MLX Whisper + MLX Gemma (Metal GPU)
+  Windows / Intel Mac: faster-whisper (CTranslate2) + llama-cpp-python (CPU/CUDA)
 
 Protocol:
   stdin  → raw PCM s16le 16kHz mono bytes (continuous stream)
@@ -18,12 +22,14 @@ import os
 import json
 import time
 import wave
+import platform
 import tempfile
 import threading
 import numpy as np
 
-# Suppress warnings
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+USE_MLX = sys.platform == "darwin" and platform.machine() == "arm64"
 
 
 def log(msg):
@@ -36,7 +42,6 @@ def emit(data):
     print(json.dumps(data, ensure_ascii=False), flush=True)
 
 
-# Language display names for translation prompt
 LANG_NAMES = {
     "vi": "Vietnamese", "en": "English", "ja": "Japanese",
     "ko": "Korean", "zh": "Chinese", "fr": "French",
@@ -53,7 +58,7 @@ class LocalPipeline:
         chunk_seconds=7,
         stride_seconds=5,
     ):
-        self.asr_model_type = asr_model  # "whisper" or "qwen"
+        self.asr_model_type = asr_model
         self.source_lang = source_lang
         self.target_lang = target_lang
         self.target_lang_name = LANG_NAMES.get(target_lang, "Vietnamese")
@@ -62,41 +67,40 @@ class LocalPipeline:
         self.sample_rate = 16000
         self.bytes_per_sample = 2  # s16le
 
-        # Audio buffer
         self.audio_buffer = bytearray()
         self.lock = threading.Lock()
         self.running = True
 
-        # Chunk size in bytes
         self.chunk_bytes = self.chunk_seconds * self.sample_rate * self.bytes_per_sample
         self.stride_bytes = self.stride_seconds * self.sample_rate * self.bytes_per_sample
 
-        # Previous transcription to detect new text
         self.prev_text = ""
+        self.context_history = []
+        self.max_context = 5
 
-        # Rolling context for translation continuity (like Soniox)
-        self.context_history = []  # list of (original, translated) tuples
-        self.max_context = 5  # keep last N translations for context
-
-        # Model references (only loaded ones)
         self.asr_model = None
         self.llm_model = None
         self.llm_tokenizer = None
+        self.use_mlx = USE_MLX
 
+        log(f"Platform: {sys.platform}/{platform.machine()}, backend: {'MLX' if self.use_mlx else 'CTranslate2+llama.cpp'}")
         self._load_models()
 
     def _load_models(self):
-        """Load ASR + LLM translator."""
+        """Load ASR + LLM translator using platform-appropriate backend."""
+        if self.use_mlx:
+            self._load_models_mlx()
+        else:
+            self._load_models_ct2()
 
-        # --- ASR Model ---
+    def _load_models_mlx(self):
+        """Load MLX-based models (Apple Silicon only)."""
         if self.asr_model_type == "whisper":
             log("Loading Whisper-large-v3-turbo (MLX)...")
             emit({"type": "status", "message": "Loading Whisper-large-v3-turbo..."})
             t = time.time()
             import mlx_whisper
-            import numpy as np
-            # Pre-load by running a tiny transcription (numpy array to bypass ffmpeg)
-            dummy_audio = np.zeros(1600, dtype=np.float32)  # 0.1s silence
+            dummy_audio = np.zeros(1600, dtype=np.float32)
             mlx_whisper.transcribe(
                 dummy_audio,
                 path_or_hf_repo="mlx-community/whisper-large-v3-turbo",
@@ -114,15 +118,50 @@ class LocalPipeline:
         else:
             raise ValueError(f"Unknown ASR model: {self.asr_model_type}")
 
-        # --- LLM Translator ---
-        log("Loading Gemma-3-4B translator...")
+        log("Loading Gemma-3-4B translator (MLX)...")
         emit({"type": "status", "message": "Loading Gemma-3-4B translator..."})
         t = time.time()
         from mlx_lm import load
         self.llm_model, self.llm_tokenizer = load("mlx-community/gemma-3-4b-it-qat-4bit")
         log(f"LLM loaded in {time.time()-t:.1f}s")
 
-        # Warm up LLM
+        log("Warming up LLM...")
+        emit({"type": "status", "message": "Warming up translator..."})
+        self._translate("テスト")
+
+        log("Pipeline ready!")
+        emit({"type": "ready"})
+
+    def _load_models_ct2(self):
+        """Load CTranslate2 + llama.cpp models (Windows/Intel Mac/Linux)."""
+        log("Loading faster-whisper (CTranslate2)...")
+        emit({"type": "status", "message": "Loading Whisper ASR model..."})
+        t = time.time()
+        from faster_whisper import WhisperModel
+        self.asr_model = WhisperModel(
+            "Systran/faster-whisper-large-v3",
+            device="cpu",
+            compute_type="int8",
+        )
+        log(f"Whisper loaded in {time.time()-t:.1f}s")
+
+        log("Loading Gemma-2-2B translator (llama.cpp)...")
+        emit({"type": "status", "message": "Loading Gemma translation model..."})
+        t = time.time()
+        from llama_cpp import Llama
+        from huggingface_hub import hf_hub_download
+        model_path = hf_hub_download(
+            "bartowski/gemma-2-2b-it-GGUF",
+            "gemma-2-2b-it-Q4_K_M.gguf",
+        )
+        self.llm_model = Llama(
+            model_path=model_path,
+            n_ctx=2048,
+            n_threads=max(1, os.cpu_count() // 2),
+            verbose=False,
+        )
+        log(f"LLM loaded in {time.time()-t:.1f}s")
+
         log("Warming up LLM...")
         emit({"type": "status", "message": "Warming up translator..."})
         self._translate("テスト")
@@ -141,11 +180,16 @@ class LocalPipeline:
         return tmp.name
 
     def _transcribe(self, wav_path):
-        """Transcribe audio using selected ASR model."""
+        """Transcribe audio using platform-appropriate ASR."""
+        if self.use_mlx:
+            return self._transcribe_mlx(wav_path)
+        else:
+            return self._transcribe_ct2(wav_path)
+
+    def _transcribe_mlx(self, wav_path):
+        """MLX Whisper transcription."""
         if self.asr_model_type == "whisper":
             import mlx_whisper
-            import numpy as np
-            # Load WAV as float32 numpy array (bypass ffmpeg)
             with wave.open(wav_path, "r") as wf:
                 raw = wf.readframes(wf.getnframes())
                 audio_np = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
@@ -159,7 +203,6 @@ class LocalPipeline:
             lang = result.get("language", self.source_lang)
             return text, lang
         else:
-            # Qwen3-ASR
             from mlx_audio.stt.generate import generate_transcription
             result = generate_transcription(
                 model=self.asr_model,
@@ -168,6 +211,20 @@ class LocalPipeline:
                 output_path="/tmp/_pipeline_asr",
             )
             return result.text.strip(), result.language
+
+    def _transcribe_ct2(self, wav_path):
+        """faster-whisper (CTranslate2) transcription."""
+        lang_code = self._whisper_lang_code()
+        segments, info = self.asr_model.transcribe(
+            wav_path,
+            language=lang_code,
+            task="transcribe",
+            beam_size=3,
+            vad_filter=True,
+        )
+        text = " ".join(seg.text.strip() for seg in segments).strip()
+        detected_lang = info.language if info.language else (lang_code or self.source_lang)
+        return text, detected_lang
 
     def _whisper_lang_code(self):
         """Map source_lang to Whisper language code."""
@@ -182,23 +239,27 @@ class LocalPipeline:
         return lang_map.get(self.source_lang, "ja")
 
     def _translate(self, text):
-        """Translate text using Gemma-3 LLM with rolling context."""
+        """Translate text using platform-appropriate LLM."""
         if not text:
             return ""
+        if self.use_mlx:
+            return self._translate_mlx(text)
+        else:
+            return self._translate_llama(text)
+
+    def _translate_mlx(self, text):
+        """MLX Gemma translation."""
         from mlx_lm import generate
 
-        # Build context: only JA originals (no translations to avoid copying)
         context_block = ""
         if self.context_history:
             recent = self.context_history[-self.max_context:]
             ctx_ja = " / ".join(orig for orig, _ in recent)
-            context_block = (
-                f"[Topic context: {ctx_ja}]\n\n"
-            )
+            context_block = f"[Topic context: {ctx_ja}]\n\n"
 
         prompt = (
             "<start_of_turn>user\n"
-            f"Translate this ONE Japanese sentence to {self.target_lang_name}.\n"
+            f"Translate this ONE sentence to {self.target_lang_name}.\n"
             f"Output ONLY the {self.target_lang_name} translation of the LAST line. Do NOT repeat previous content.\n"
             "\n"
             "Examples:\n"
@@ -206,7 +267,7 @@ class LocalPipeline:
             "JA: おでんを作って食べました。→ Tôi đã làm oden ăn.\n"
             "JA: えっ？コンビニにおでん？→ Hả? Oden ở cửa hàng tiện lợi á?\n"
             "\n"
-            "Rules: Vietnamese only. Keep names (マイ=Mai). Keep food (おでん=oden). ONE sentence output only.\n"
+            f"Rules: {self.target_lang_name} only. Keep names. Keep food terms. ONE sentence output only.\n"
             "\n"
             f"{context_block}"
             f"Translate: {text}\n"
@@ -218,18 +279,61 @@ class LocalPipeline:
             self.llm_model,
             self.llm_tokenizer,
             prompt=prompt,
-            max_tokens=100,  # Shorter — only 1 sentence needed
+            max_tokens=100,
         )
 
-        # Post-process: clean up LLM output
         result = self._clean_translation(result)
 
-        # Dedup: remove overlap with previous translation
         if result and self.context_history:
             last_trans = self.context_history[-1][1]
             result = self._remove_overlap(result, last_trans)
 
-        # Add to context history
+        if result:
+            self.context_history.append((text, result))
+            if len(self.context_history) > self.max_context * 2:
+                self.context_history = self.context_history[-self.max_context:]
+
+        return result
+
+    def _translate_llama(self, text):
+        """llama.cpp Gemma translation."""
+        context_block = ""
+        if self.context_history:
+            recent = self.context_history[-self.max_context:]
+            ctx_orig = " / ".join(orig for orig, _ in recent)
+            context_block = f"[Topic context: {ctx_orig}]\n\n"
+
+        prompt = (
+            f"<start_of_turn>user\n"
+            f"Translate this ONE sentence to {self.target_lang_name}.\n"
+            f"Output ONLY the {self.target_lang_name} translation. Do NOT repeat previous content.\n"
+            "\n"
+            "Examples:\n"
+            "JA: こんにちは、マイです。→ Xin chào, tôi là Mai.\n"
+            "EN: I like sushi. → Tôi thích sushi.\n"
+            "\n"
+            f"Rules: {self.target_lang_name} only. Keep names. ONE sentence output only.\n"
+            "\n"
+            f"{context_block}"
+            f"Translate: {text}\n"
+            "<end_of_turn>\n"
+            "<start_of_turn>model\n"
+        )
+
+        output = self.llm_model(
+            prompt,
+            max_tokens=100,
+            stop=["<end_of_turn>", "<start_of_turn>", "\n\n"],
+            temperature=0.3,
+        )
+
+        result = output["choices"][0]["text"].strip() if output["choices"] else ""
+        result = self._clean_translation(result)
+
+        if result and self.context_history:
+            last_trans = self.context_history[-1][1]
+            result = self._remove_overlap(result, last_trans)
+
         if result:
             self.context_history.append((text, result))
             if len(self.context_history) > self.max_context * 2:
@@ -240,15 +344,11 @@ class LocalPipeline:
     def _clean_translation(self, text):
         """Remove special tokens and truncate at hallucination."""
         import re
-        # Remove Gemma special tokens
         text = text.split('<end_of_turn>')[0]
         text = re.sub(r'<[^>]+>', '', text)
-        # Take only the first meaningful line
         lines = [l.strip() for l in text.split('\n') if l.strip()]
         text = lines[0] if lines else ''
-        # Remove any prefix artifacts
         text = re.sub(r'^(VI:\s*|→\s*|Translate:\s*)', '', text)
-        # Clean up whitespace
         text = re.sub(r'\s+', ' ', text).strip()
         return text
 
@@ -256,12 +356,10 @@ class LocalPipeline:
         """Remove text from new_text that overlaps with prev_text."""
         if not prev_text or not new_text:
             return new_text
-        # Check if new_text starts with a significant chunk of prev_text
         words_new = new_text.split()
         words_prev = prev_text.split()
         if len(words_prev) < 3 or len(words_new) < 3:
             return new_text
-        # Find longest prefix overlap
         max_overlap = min(len(words_new), len(words_prev))
         overlap_len = 0
         for i in range(3, max_overlap + 1):
@@ -277,39 +375,34 @@ class LocalPipeline:
         """Remove overlapping text from previous transcript chunk."""
         if not self.prev_text or not text:
             return text
-        
+
         prev = self.prev_text
-        # Find longest suffix of prev_text that matches a prefix of text
-        # Use character-level matching for Japanese (no spaces between words)
         best_overlap = 0
-        min_overlap = 3  # At least 3 chars to count as overlap
-        max_check = min(len(prev), len(text), 100)  # Don't check too far
-        
+        min_overlap = 3
+        max_check = min(len(prev), len(text), 100)
+
         for length in range(min_overlap, max_check + 1):
             if prev[-length:] == text[:length]:
                 best_overlap = length
-        
+
         if best_overlap >= min_overlap:
             new_text = text[best_overlap:].strip()
             return new_text if new_text else text
-        
+
         return text
 
     def _process_chunk(self, pcm_bytes):
-        """Process one audio chunk: transcribe → emit original → translate → emit translation."""
+        """Process one audio chunk: transcribe → translate → emit."""
         t_start = time.time()
 
-        # Check if audio has actual content (not silence)
         samples = np.frombuffer(pcm_bytes, dtype=np.int16)
         rms = np.sqrt(np.mean(samples.astype(np.float32) ** 2))
-        if rms < 100:  # Silence threshold
+        if rms < 100:
             return
 
-        # Save as WAV
         wav_path = self._save_chunk_as_wav(pcm_bytes)
 
         try:
-            # Step 1: Transcribe
             t1 = time.time()
             text, lang = self._transcribe(wav_path)
             t_asr = time.time() - t1
@@ -317,7 +410,6 @@ class LocalPipeline:
             if not text or text == self.prev_text:
                 return
 
-            # Dedup transcript: strip overlap with previous chunk
             new_text = self._dedup_transcript(text)
             if not new_text or len(new_text) < 3:
                 self.prev_text = text
@@ -326,7 +418,6 @@ class LocalPipeline:
             log(f"Transcript: {text}")
             log(f"New text:   {new_text}")
 
-            # Translate
             t2 = time.time()
             translated = self._translate(new_text)
             t_llm = time.time() - t2
@@ -334,7 +425,6 @@ class LocalPipeline:
             total = time.time() - t_start
             log(f"ASR={t_asr:.2f}s LLM={t_llm:.2f}s total={total:.2f}s")
 
-            # Emit combined result
             emit({
                 "type": "result",
                 "original": new_text,
@@ -347,7 +437,7 @@ class LocalPipeline:
                 },
             })
 
-            self.prev_text = text  # Store FULL text for next dedup
+            self.prev_text = text
 
         finally:
             os.unlink(wav_path)
@@ -368,19 +458,17 @@ class LocalPipeline:
 
     def run(self):
         """Main loop: read audio, process chunks with sliding window."""
-        # Start stdin reader thread
         reader = threading.Thread(target=self.stdin_reader, daemon=True)
         reader.start()
 
-        processed_pos = 0  # Track how far we've processed
+        processed_pos = 0
 
         while self.running:
-            time.sleep(0.5)  # Check every 500ms
+            time.sleep(0.5)
 
             with self.lock:
                 buf_len = len(self.audio_buffer)
 
-            # When we have enough data for a chunk
             if buf_len - processed_pos >= self.chunk_bytes:
                 with self.lock:
                     chunk = bytes(self.audio_buffer[processed_pos : processed_pos + self.chunk_bytes])
@@ -388,10 +476,9 @@ class LocalPipeline:
                 self._process_chunk(chunk)
                 processed_pos += self.stride_bytes
 
-        # Process remaining audio
         with self.lock:
             remaining = len(self.audio_buffer) - processed_pos
-            if remaining > self.sample_rate * self.bytes_per_sample:  # At least 1 second
+            if remaining > self.sample_rate * self.bytes_per_sample:
                 chunk = bytes(self.audio_buffer[processed_pos:])
                 self._process_chunk(chunk)
 
@@ -414,7 +501,6 @@ def main():
     args = parser.parse_args()
 
     if args.test:
-        # Test mode: process a file directly
         pipeline = LocalPipeline(
             asr_model=args.asr_model,
             source_lang=args.source_lang,
@@ -427,7 +513,6 @@ def main():
         with wave.open(args.test_file, "r") as wf:
             pcm = wf.readframes(wf.getnframes())
 
-        # Simulate streaming: feed chunks
         chunk_bytes = args.chunk_seconds * 16000 * 2
         stride_bytes = args.stride_seconds * 16000 * 2
         pos = 0
@@ -436,13 +521,11 @@ def main():
             pipeline._process_chunk(chunk)
             pos += stride_bytes
 
-        # Remaining
         if pos < len(pcm) and len(pcm) - pos > 16000 * 2:
             pipeline._process_chunk(pcm[pos:])
 
         emit({"type": "done"})
     else:
-        # Normal mode: read from stdin
         pipeline = LocalPipeline(
             asr_model=args.asr_model,
             source_lang=args.source_lang,

@@ -83,11 +83,11 @@ Soniox cung cấp nhận diện giọng nói và dịch real-time.
 | Chế độ | Tốc độ | Chất lượng | Chi phí | Internet |
 |--------|--------|------------|---------|----------|
 | ☁️ **Soniox API (Cloud)** | Real-time (~2 giây) | 9/10 | ~$0.12/giờ | Cần |
-| 🖥️ **Local MLX (Offline)** | ~10 giây delay | 7/10 | Miễn phí | Không cần |
+| 🖥️ **Local Models (Offline)** | ~3-8 giây delay | 7/10 | Miễn phí | Không cần |
 
 6. Bấm **Save & Close**
 
-> **Local MLX** yêu cầu Apple Silicon (M1+) và ~5 GB ổ cứng. Model tự tải lần đầu.
+> **Local Models** yêu cầu ~5 GB ổ cứng. Apple Silicon dùng MLX (nhanh, ~3-4 giây). Intel Mac dùng faster-whisper + llama.cpp (CPU, ~5-8 giây, cần Python 3.10+). Model tự tải lần đầu.
 
 ---
 

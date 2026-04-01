@@ -83,11 +83,11 @@ Soniox provides real-time speech recognition and translation.
 | Mode | Speed | Quality | Cost | Internet |
 |------|-------|---------|------|----------|
 | ☁️ **Soniox API (Cloud)** | Real-time (~2s) | 9/10 | ~$0.12/hr | Required |
-| 🖥️ **Local MLX (Offline)** | ~10s delay | 7/10 | Free | Not needed |
+| 🖥️ **Local Models (Offline)** | ~3-8s delay | 7/10 | Free | Not needed |
 
 6. Click **Save & Close**
 
-> **Local MLX** requires Apple Silicon (M1+) and ~5 GB disk. Models are downloaded automatically on first use.
+> **Local Models** requires ~5 GB disk. Apple Silicon uses MLX (fast, ~3-4s). Intel Mac uses faster-whisper + llama.cpp (CPU, ~5-8s, requires Python 3.10+). Models are downloaded automatically on first use.
 
 ---
 
