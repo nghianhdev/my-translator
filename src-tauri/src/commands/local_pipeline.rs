@@ -202,6 +202,12 @@ pub fn start_local_pipeline(
         .arg("--source-lang").arg(&source_lang)
         .arg("--target-lang").arg(&target_lang)
         .env("TOKENIZERS_PARALLELISM", "false")
+        // Help diagnose native crashes (0xc0000005) in Python wheels.
+        .env("PYTHONFAULTHANDLER", "1")
+        .env("PYTHONUNBUFFERED", "1")
+        // Force UTF-8 so Vietnamese text doesn't crash on cp932 consoles.
+        .env("PYTHONUTF8", "1")
+        .env("PYTHONIOENCODING", "utf-8")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -237,10 +243,20 @@ pub fn start_local_pipeline(
     let channel_clone = channel.clone();
     std::thread::spawn(move || {
         use std::io::BufRead;
-        let reader = std::io::BufReader::new(stdout);
-        for line in reader.lines() {
-            match line {
-                Ok(line) if !line.is_empty() => {
+        let mut reader = std::io::BufReader::new(stdout);
+        loop {
+            let mut buf = Vec::new();
+            match reader.read_until(b'\n', &mut buf) {
+                Ok(0) => break,
+                Ok(_) => {
+                    while buf.last() == Some(&b'\n') || buf.last() == Some(&b'\r') {
+                        buf.pop();
+                    }
+                    if buf.is_empty() {
+                        continue;
+                    }
+                    let line = String::from_utf8(buf.clone())
+                        .unwrap_or_else(|_| String::from_utf8_lossy(&buf).to_string());
                     log_to_file(&format!("stdout: {}", &line));
                     let _ = channel_clone.send(line);
                 }
@@ -248,7 +264,6 @@ pub fn start_local_pipeline(
                     log_to_file(&format!("stdout error: {}", e));
                     break;
                 }
-                _ => {}
             }
         }
         log_to_file("stdout reader ended");
@@ -257,17 +272,31 @@ pub fn start_local_pipeline(
     let channel_clone2 = channel.clone();
     std::thread::spawn(move || {
         use std::io::BufRead;
-        let reader = std::io::BufReader::new(stderr);
-        for line in reader.lines() {
-            match line {
-                Ok(line) => {
+        let mut reader = std::io::BufReader::new(stderr);
+        loop {
+            let mut buf = Vec::new();
+            match reader.read_until(b'\n', &mut buf) {
+                Ok(0) => break,
+                Ok(_) => {
+                    while buf.last() == Some(&b'\n') || buf.last() == Some(&b'\r') {
+                        buf.pop();
+                    }
+                    if buf.is_empty() {
+                        continue;
+                    }
+                    let line = String::from_utf8(buf.clone())
+                        .unwrap_or_else(|_| String::from_utf8_lossy(&buf).to_string());
                     log_to_file(&format!("stderr: {}", line));
                     let escaped = line.replace('"', r#"\""#);
-                    let _ = channel_clone2.send(
-                        format!(r#"{{"type":"status","message":"{}"}}"#, escaped)
-                    );
+                    let _ = channel_clone2.send(format!(
+                        r#"{{"type":"status","message":"{}"}}"#,
+                        escaped
+                    ));
                 }
-                Err(_) => break,
+                Err(e) => {
+                    log_to_file(&format!("stderr error: {}", e));
+                    break;
+                }
             }
         }
         log_to_file("stderr reader ended");
@@ -287,15 +316,48 @@ pub fn send_audio_to_pipeline(
     state: tauri::State<'_, LocalPipelineState>,
 ) -> Result<(), String> {
     let mut proc = state.process.lock().map_err(|e| e.to_string())?;
-    if let Some(ref mut child) = *proc {
-        if let Some(ref mut stdin) = child.stdin {
-            stdin.write_all(&data).map_err(|e| {
-                log_to_file(&format!("stdin write error: {}", e));
-                e.to_string()
-            })?;
-            stdin.flush().map_err(|e| e.to_string())?;
+    let Some(ref mut child) = *proc else {
+        return Err("Local pipeline is not running".to_string());
+    };
+
+    // If the child already exited, stop and clear state so the UI can restart cleanly.
+    match child.try_wait() {
+        Ok(Some(status)) => {
+            log_to_file(&format!("pipeline already exited: {}", status));
+            stop_local_pipeline_inner(&state);
+            return Err(format!("Local pipeline exited: {}", status));
+        }
+        Ok(None) => {}
+        Err(e) => {
+            log_to_file(&format!("try_wait error: {}", e));
         }
     }
+
+    let Some(ref mut stdin) = child.stdin else {
+        log_to_file("pipeline stdin is closed (None)");
+        stop_local_pipeline_inner(&state);
+        return Err("Local pipeline stdin is closed".to_string());
+    };
+
+    if let Err(e) = stdin.write_all(&data) {
+        let raw = e.raw_os_error();
+        let kind = e.kind();
+        log_to_file(&format!("stdin write error: {} (kind={:?}, raw={:?})", e, kind, raw));
+
+        // Windows: ERROR_NO_DATA (232) => "The pipe is being closed."
+        if kind == std::io::ErrorKind::BrokenPipe || raw == Some(232) {
+            stop_local_pipeline_inner(&state);
+            return Err("Local pipeline disconnected (stdin pipe closed)".to_string());
+        }
+
+        return Err(e.to_string());
+    }
+
+    stdin.flush().map_err(|e| {
+        log_to_file(&format!("stdin flush error: {}", e));
+        e.to_string()
+    })?;
+
     Ok(())
 }
 

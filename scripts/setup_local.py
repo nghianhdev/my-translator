@@ -120,7 +120,7 @@ def create_venv(python_path, env_dir):
         capture_output=True, text=True, timeout=120
     )
 
-    emit({"type": "progress", "step": "venv", "message": "Python environment created ✓", "done": True})
+    emit({"type": "progress", "step": "venv", "message": "Python environment created [OK]", "done": True})
 
 
 def install_packages(env_dir):
@@ -164,7 +164,7 @@ def install_packages(env_dir):
     emit({
         "type": "progress",
         "step": "packages",
-        "message": "All packages installed ✓",
+        "message": "All packages installed [OK]",
         "progress": 100,
         "done": True,
     })
@@ -226,7 +226,7 @@ except Exception as e:
     emit({
         "type": "progress",
         "step": "models",
-        "message": "All models downloaded ✓",
+        "message": "All models downloaded [OK]",
         "progress": 100,
         "done": True,
     })
@@ -287,7 +287,7 @@ def main():
             sys.exit(1)
 
         emit({"type": "progress", "step": "check",
-              "message": f"Found Python {python_version} at {python_path} ✓"})
+              "message": f"Found Python {python_version} at {python_path} [OK]"})
 
         create_venv(python_path, env_dir)
         install_packages(env_dir)

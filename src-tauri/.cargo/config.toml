@@ -1,0 +1,6 @@
+[build]
+# On Windows, incremental compilation directories can fail to finalize
+# with "Access is denied" due to file locking/antivirus scanning.
+# Disabling incremental avoids noisy warnings during `cargo check`/`tauri dev`.
+incremental = false
+

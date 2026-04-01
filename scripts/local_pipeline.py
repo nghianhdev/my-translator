@@ -29,7 +29,16 @@ import numpy as np
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+# Dump Python stack on fatal native crashes (Windows 0xC0000005, etc.)
+try:
+    import faulthandler
+    faulthandler.enable(all_threads=True)
+except Exception:
+    pass
+
 USE_MLX = sys.platform == "darwin" and platform.machine() == "arm64"
+DISABLE_ASR = os.environ.get("PIPELINE_DISABLE_ASR") == "1"
+DISABLE_LLM = os.environ.get("PIPELINE_DISABLE_LLM") == "1"
 
 
 def log(msg):
@@ -138,12 +147,34 @@ class LocalPipeline:
         emit({"type": "status", "message": "Loading Whisper ASR model..."})
         t = time.time()
         from faster_whisper import WhisperModel
-        self.asr_model = WhisperModel(
-            "Systran/faster-whisper-large-v3",
-            device="cpu",
-            compute_type="int8",
-        )
+        # Some Windows setups are sensitive to threading/VAD; prefer conservative defaults.
+        compute_type = os.environ.get("FW_COMPUTE_TYPE")
+        if not compute_type:
+            # Stability-first default on Windows. You can override via FW_COMPUTE_TYPE=int8 for speed.
+            compute_type = "float32" if sys.platform == "win32" else "int8"
+        try:
+            self.asr_model = WhisperModel(
+                "Systran/faster-whisper-large-v3",
+                device="cpu",
+                compute_type=compute_type,
+                cpu_threads=max(1, (os.cpu_count() or 4) // 2),
+                num_workers=1,
+            )
+        except TypeError:
+            # Older/newer faster-whisper versions may not support these kwargs.
+            self.asr_model = WhisperModel(
+                "Systran/faster-whisper-large-v3",
+                device="cpu",
+                compute_type=compute_type,
+            )
         log(f"Whisper loaded in {time.time()-t:.1f}s")
+
+        if DISABLE_LLM:
+            log("LLM disabled via PIPELINE_DISABLE_LLM=1")
+            emit({"type": "status", "message": "LLM disabled (PIPELINE_DISABLE_LLM=1)"})
+            log("Pipeline ready!")
+            emit({"type": "ready"})
+            return
 
         log("Loading Gemma-2-2B translator (llama.cpp)...")
         emit({"type": "status", "message": "Loading Gemma translation model..."})
@@ -181,6 +212,8 @@ class LocalPipeline:
 
     def _transcribe(self, wav_path):
         """Transcribe audio using platform-appropriate ASR."""
+        if DISABLE_ASR:
+            return "", self.source_lang
         if self.use_mlx:
             return self._transcribe_mlx(wav_path)
         else:
@@ -219,8 +252,9 @@ class LocalPipeline:
             wav_path,
             language=lang_code,
             task="transcribe",
-            beam_size=3,
-            vad_filter=True,
+            beam_size=1,
+            # VAD can trigger extra native deps; disable for stability.
+            vad_filter=False,
         )
         text = " ".join(seg.text.strip() for seg in segments).strip()
         detected_lang = info.language if info.language else (lang_code or self.source_lang)
@@ -241,6 +275,8 @@ class LocalPipeline:
     def _translate(self, text):
         """Translate text using platform-appropriate LLM."""
         if not text:
+            return ""
+        if DISABLE_LLM:
             return ""
         if self.use_mlx:
             return self._translate_mlx(text)
@@ -393,54 +429,70 @@ class LocalPipeline:
 
     def _process_chunk(self, pcm_bytes):
         """Process one audio chunk: transcribe → translate → emit."""
-        t_start = time.time()
-
-        samples = np.frombuffer(pcm_bytes, dtype=np.int16)
-        rms = np.sqrt(np.mean(samples.astype(np.float32) ** 2))
-        if rms < 100:
-            return
-
-        wav_path = self._save_chunk_as_wav(pcm_bytes)
-
         try:
-            t1 = time.time()
-            text, lang = self._transcribe(wav_path)
-            t_asr = time.time() - t1
+            # Ensure 16-bit alignment for int16 PCM.
+            if not pcm_bytes or len(pcm_bytes) < 2:
+                return
+            if len(pcm_bytes) % 2 == 1:
+                pcm_bytes = pcm_bytes[:-1]
 
-            if not text or text == self.prev_text:
+            t_start = time.time()
+
+            samples = np.frombuffer(pcm_bytes, dtype=np.int16)
+            rms = np.sqrt(np.mean(samples.astype(np.float32) ** 2))
+            if rms < 100:
                 return
 
-            new_text = self._dedup_transcript(text)
-            if not new_text or len(new_text) < 3:
+            wav_path = self._save_chunk_as_wav(pcm_bytes)
+
+            try:
+                t1 = time.time()
+                text, lang = self._transcribe(wav_path)
+                t_asr = time.time() - t1
+
+                if not text or text == self.prev_text:
+                    return
+
+                new_text = self._dedup_transcript(text)
+                if not new_text or len(new_text) < 3:
+                    self.prev_text = text
+                    return
+
+                log(f"Transcript: {text}")
+                log(f"New text:   {new_text}")
+
+                t2 = time.time()
+                translated = self._translate(new_text)
+                t_llm = time.time() - t2
+
+                total = time.time() - t_start
+                log(f"ASR={t_asr:.2f}s LLM={t_llm:.2f}s total={total:.2f}s")
+
+                emit({
+                    "type": "result",
+                    "original": new_text,
+                    "translated": translated,
+                    "language": lang if isinstance(lang, str) else (lang[0] if lang else "ja"),
+                    "timing": {
+                        "asr": round(t_asr, 2),
+                        "translate": round(t_llm, 2),
+                        "total": round(total, 2),
+                    },
+                })
+
                 self.prev_text = text
-                return
 
-            log(f"Transcript: {text}")
-            log(f"New text:   {new_text}")
+            finally:
+                try:
+                    os.unlink(wav_path)
+                except Exception:
+                    pass
 
-            t2 = time.time()
-            translated = self._translate(new_text)
-            t_llm = time.time() - t2
-
-            total = time.time() - t_start
-            log(f"ASR={t_asr:.2f}s LLM={t_llm:.2f}s total={total:.2f}s")
-
-            emit({
-                "type": "result",
-                "original": new_text,
-                "translated": translated,
-                "language": lang if isinstance(lang, str) else (lang[0] if lang else "ja"),
-                "timing": {
-                    "asr": round(t_asr, 2),
-                    "translate": round(t_llm, 2),
-                    "total": round(total, 2),
-                },
-            })
-
-            self.prev_text = text
-
-        finally:
-            os.unlink(wav_path)
+        except Exception as e:
+            # Keep the pipeline alive; report error via stderr + status.
+            log(f"_process_chunk error: {e}")
+            emit({"type": "status", "message": f"Pipeline error: {e}"})
+            return
 
     def stdin_reader(self):
         """Read PCM bytes from stdin into buffer."""
