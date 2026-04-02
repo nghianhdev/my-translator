@@ -97,9 +97,17 @@ Pneumonia = Viêm phổi
 
 Add terms in Settings → Translation → Translation terms. Great for religious, medical, or technical content.
 
-### 🖥️ Local Mode (Apple Silicon only)
+### 🖥️ Local Mode (Offline)
 
-Experimental offline mode using MLX + Whisper + Gemma — runs 100% on-device. JA/EN/ZH/KO → VI/EN.
+Run 100% on-device — no API key, no internet after setup. Whisper (ASR) + Gemma (translation).
+
+| | **macOS Apple Silicon** | **Windows / Intel Mac** |
+|--|-------------------------|------------------------|
+| **Backend** | MLX (Metal GPU) | faster-whisper + llama.cpp (CPU) |
+| **Latency** | ~3–4s | ~5–8s |
+| **Setup** | ~5 GB one-time download | ~5 GB one-time download |
+| **Languages** | JA/EN/ZH/KO → any | JA/EN/ZH/KO → any |
+| **Requires** | — | Python 3.10+ |
 
 ---
 

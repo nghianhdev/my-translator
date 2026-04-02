@@ -165,10 +165,6 @@ impl MicCapture {
         // Drop the stream to stop capturing
         self._stream = None;
     }
-
-    pub fn is_capturing(&self) -> bool {
-        self.is_capturing.load(Ordering::SeqCst)
-    }
 }
 
 impl Default for MicCapture {

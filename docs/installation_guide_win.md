@@ -7,7 +7,8 @@ Step-by-step guide to install and use **My Translator** on Windows 10/11.
 ## Requirements
 
 - Windows 10 or later (x64 or ARM64)
-- [Soniox](https://soniox.com) API key (pay-per-use, ~$0.12/hour)
+- **Cloud mode**: [Soniox](https://soniox.com) API key (pay-per-use, ~$0.12/hour)
+- **Local mode** (optional): Python 3.10+ installed, ~5 GB free disk space (for AI models, one-time download)
 - **TTS narration** (optional): Edge TTS (free, no API key) or premium providers. See [TTS Guide](tts_guide.md)
 
 ---

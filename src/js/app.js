@@ -82,27 +82,40 @@ class App {
 
     async _checkPlatformSupport() {
         try {
-            // Check if we're on macOS Apple Silicon
             const arch = await invoke('get_platform_info');
             const info = JSON.parse(arch);
+            this.platformOS = info.os;
+            this.platformArch = info.arch;
             this.isAppleSilicon = (info.os === 'macos' && info.arch === 'aarch64');
+            this.supportsLocalMode = (info.os === 'macos' || info.os === 'windows');
         } catch {
-            // Fallback: check via navigator
+            this.platformOS = 'unknown';
+            this.platformArch = 'unknown';
             this.isAppleSilicon = navigator.platform === 'MacIntel' &&
                 navigator.userAgent.includes('Mac OS X');
+            this.supportsLocalMode = this.isAppleSilicon ||
+                navigator.userAgent.includes('Windows');
         }
 
-        if (!this.isAppleSilicon) {
-            // Hide Local MLX option
+        if (!this.supportsLocalMode) {
             const select = document.getElementById('select-translation-mode');
             const localOption = select?.querySelector('option[value="local"]');
             if (localOption) localOption.remove();
 
-            // Force soniox mode if user had local selected
             const settings = settingsManager.get();
             if (settings.translation_mode === 'local') {
                 settings.translation_mode = 'soniox';
                 settingsManager.save(settings);
+            }
+        }
+
+        // Update UI hint based on platform
+        const hintLocal = document.getElementById('hint-mode-local');
+        if (hintLocal && this.supportsLocalMode) {
+            if (this.isAppleSilicon) {
+                hintLocal.textContent = 'Offline, free, ~3-4s delay (MLX — Apple Silicon GPU)';
+            } else {
+                hintLocal.textContent = 'Offline, free, ~5-8s delay (CPU — requires Python 3.10+)';
             }
         }
     }
@@ -1017,7 +1030,7 @@ class App {
     }
 
     async _startLocalMode(settings) {
-        console.log('[App] Starting Local mode (MLX models)...');
+        console.log('[App] Starting Local mode...');
         this._updateStatus('connecting');
 
         // Step 0: Check audio permission FIRST (before loading models)
@@ -1043,15 +1056,15 @@ class App {
             const checkResult = await invoke('check_mlx_setup');
             const status = JSON.parse(checkResult);
             if (!status.ready) {
-                this._showToast('Setting up MLX models (one-time, ~5GB)...', 'success');
-                this.transcriptUI.showStatusMessage('Downloading MLX models (one-time setup)...');
+                this._showToast('Setting up local models (one-time, ~5GB)...', 'success');
+                this.transcriptUI.showStatusMessage('Downloading local models (one-time setup)...');
                 await this._runMlxSetup();
             }
         } catch (err) {
-            console.warn('[App] MLX check failed (proceeding anyway):', err);
+            console.warn('[App] Local model check failed (proceeding anyway):', err);
         }
 
-        console.log('[App] MLX check passed, starting pipeline...');
+        console.log('[App] Local model check passed, starting pipeline...');
 
         // Step 1: Start pipeline FIRST (independent of audio)
         try {
@@ -1129,7 +1142,7 @@ class App {
                 this._updateStatus('connected');
                 this.transcriptUI.removeStatusMessage();
                 this.transcriptUI.showListening();
-                this._showToast('Local models ready!', 'success');
+                this._showToast('Local models loaded!', 'success');
                 break;
             case 'result':
                 // Chase effect: show original first (gray), then translation (white)
@@ -1345,7 +1358,7 @@ class App {
         const targetLang = document.getElementById('select-target-lang')?.value || 'vi';
 
         const content = this.transcriptUI.getFormattedContent({
-            model: this.translationMode === 'soniox' ? 'Soniox Cloud API' : 'Local MLX Whisper',
+            model: this.translationMode === 'soniox' ? 'Soniox Cloud API' : 'Local Whisper',
             sourceLang,
             targetLang,
             duration,
