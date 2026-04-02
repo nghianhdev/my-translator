@@ -150,8 +150,8 @@ class LocalPipeline:
         # Some Windows setups are sensitive to threading/VAD; prefer conservative defaults.
         compute_type = os.environ.get("FW_COMPUTE_TYPE")
         if not compute_type:
-            # Stability-first default on Windows. You can override via FW_COMPUTE_TYPE=int8 for speed.
-            compute_type = "float32" if sys.platform == "win32" else "int8"
+            # Speed-first default. Override via FW_COMPUTE_TYPE=float32 if you hit instability.
+            compute_type = "int8"
         try:
             self.asr_model = WhisperModel(
                 "Systran/faster-whisper-large-v3",
@@ -200,32 +200,20 @@ class LocalPipeline:
         log("Pipeline ready!")
         emit({"type": "ready"})
 
-    def _save_chunk_as_wav(self, pcm_bytes):
-        """Save PCM bytes as temporary WAV file."""
-        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-        with wave.open(tmp.name, "w") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(self.sample_rate)
-            wf.writeframes(pcm_bytes)
-        return tmp.name
-
-    def _transcribe(self, wav_path):
+    def _transcribe(self, pcm_bytes: bytes):
         """Transcribe audio using platform-appropriate ASR."""
         if DISABLE_ASR:
             return "", self.source_lang
         if self.use_mlx:
-            return self._transcribe_mlx(wav_path)
+            return self._transcribe_mlx(pcm_bytes)
         else:
-            return self._transcribe_ct2(wav_path)
+            return self._transcribe_ct2(pcm_bytes)
 
-    def _transcribe_mlx(self, wav_path):
+    def _transcribe_mlx(self, pcm_bytes: bytes):
         """MLX Whisper transcription."""
         if self.asr_model_type == "whisper":
             import mlx_whisper
-            with wave.open(wav_path, "r") as wf:
-                raw = wf.readframes(wf.getnframes())
-                audio_np = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+            audio_np = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
             result = mlx_whisper.transcribe(
                 audio_np,
                 path_or_hf_repo=self.asr_model,
@@ -237,19 +225,34 @@ class LocalPipeline:
             return text, lang
         else:
             from mlx_audio.stt.generate import generate_transcription
+            # Qwen ASR currently expects a file path; keep this slow fallback.
+            tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+            wav_path = tmp.name
+            tmp.close()
+            with wave.open(wav_path, "w") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(self.sample_rate)
+                wf.writeframes(pcm_bytes)
             result = generate_transcription(
                 model=self.asr_model,
                 audio=wav_path,
                 format="json",
                 output_path="/tmp/_pipeline_asr",
             )
+            try:
+                os.unlink(wav_path)
+            except Exception:
+                pass
             return result.text.strip(), result.language
 
-    def _transcribe_ct2(self, wav_path):
+    def _transcribe_ct2(self, pcm_bytes: bytes):
         """faster-whisper (CTranslate2) transcription."""
+        # faster-whisper accepts float32 audio in [-1, 1].
+        audio_np = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) * (1.0 / 32768.0)
         lang_code = self._whisper_lang_code()
         segments, info = self.asr_model.transcribe(
-            wav_path,
+            audio_np,
             language=lang_code,
             task="transcribe",
             beam_size=1,
@@ -443,50 +446,41 @@ class LocalPipeline:
             if rms < 100:
                 return
 
-            wav_path = self._save_chunk_as_wav(pcm_bytes)
+            t1 = time.time()
+            text, lang = self._transcribe(pcm_bytes)
+            t_asr = time.time() - t1
 
-            try:
-                t1 = time.time()
-                text, lang = self._transcribe(wav_path)
-                t_asr = time.time() - t1
+            if not text or text == self.prev_text:
+                return
 
-                if not text or text == self.prev_text:
-                    return
-
-                new_text = self._dedup_transcript(text)
-                if not new_text or len(new_text) < 3:
-                    self.prev_text = text
-                    return
-
-                log(f"Transcript: {text}")
-                log(f"New text:   {new_text}")
-
-                t2 = time.time()
-                translated = self._translate(new_text)
-                t_llm = time.time() - t2
-
-                total = time.time() - t_start
-                log(f"ASR={t_asr:.2f}s LLM={t_llm:.2f}s total={total:.2f}s")
-
-                emit({
-                    "type": "result",
-                    "original": new_text,
-                    "translated": translated,
-                    "language": lang if isinstance(lang, str) else (lang[0] if lang else "ja"),
-                    "timing": {
-                        "asr": round(t_asr, 2),
-                        "translate": round(t_llm, 2),
-                        "total": round(total, 2),
-                    },
-                })
-
+            new_text = self._dedup_transcript(text)
+            if not new_text or len(new_text) < 3:
                 self.prev_text = text
+                return
 
-            finally:
-                try:
-                    os.unlink(wav_path)
-                except Exception:
-                    pass
+            log(f"Transcript: {text}")
+            log(f"New text:   {new_text}")
+
+            t2 = time.time()
+            translated = self._translate(new_text)
+            t_llm = time.time() - t2
+
+            total = time.time() - t_start
+            log(f"ASR={t_asr:.2f}s LLM={t_llm:.2f}s total={total:.2f}s")
+
+            emit({
+                "type": "result",
+                "original": new_text,
+                "translated": translated,
+                "language": lang if isinstance(lang, str) else (lang[0] if lang else "ja"),
+                "timing": {
+                    "asr": round(t_asr, 2),
+                    "translate": round(t_llm, 2),
+                    "total": round(total, 2),
+                },
+            })
+
+            self.prev_text = text
 
         except Exception as e:
             # Keep the pipeline alive; report error via stderr + status.
@@ -546,8 +540,9 @@ def main():
                         help="ASR model: 'whisper' (large-v3-turbo) or 'qwen' (Qwen3-ASR-0.6B)")
     parser.add_argument("--source-lang", default="ja", help="Source language")
     parser.add_argument("--target-lang", default="vi", help="Target language code (vi, en, etc.)")
-    parser.add_argument("--chunk-seconds", type=int, default=7, help="Audio chunk size in seconds")
-    parser.add_argument("--stride-seconds", type=int, default=5, help="Stride between chunks in seconds")
+    # Latency-first defaults for CPU Windows: smaller chunks return faster.
+    parser.add_argument("--chunk-seconds", type=int, default=5, help="Audio chunk size in seconds")
+    parser.add_argument("--stride-seconds", type=int, default=3, help="Stride between chunks in seconds")
     parser.add_argument("--test", action="store_true", help="Run test with sample audio file")
     parser.add_argument("--test-file", default="/tmp/test_japanese.wav", help="Test audio file")
     args = parser.parse_args()
